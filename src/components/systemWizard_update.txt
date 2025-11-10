@@ -1,0 +1,374 @@
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { ChevronRight, ChevronLeft, Check, RefreshCw, Zap } from 'lucide-react';
+
+interface StepWizardProps {
+  labels: { [key: string]: string };
+  values: { [key: string]: string };
+  dropdownOptions: { [key: string]: string[] };
+  onUpdateValue: (cell: string, value: string) => Promise<void>;
+  onComplete: () => void;
+  isLoading?: boolean;
+}
+
+export const StepWizard: React.FC<StepWizardProps> = ({
+  labels,
+  values,
+  dropdownOptions,
+  onUpdateValue,
+  onComplete,
+  isLoading
+}) => {
+  const [currentStep, setCurrentStep] = useState(0);
+  const [answers, setAnswers] = useState<{ [key: string]: string }>({});
+  const [isUpdating, setIsUpdating] = useState(false);
+  const [autoSelectionQueue, setAutoSelectionQueue] = useState<Set<string>>(new Set());
+  const [completedSteps, setCompletedSteps] = useState<Set<number>>(new Set());
+  
+  // Refs for preventing race conditions
+  const isProcessingRef = useRef(false);
+  const currentStepRef = useRef(0);
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
+  
+  const dropdownCells = useMemo(() => 
+    ['B1', 'B11', 'B16', 'B22', 'B25', 'B30', 'B33', 'B36', 'B42', 'B52', 'B56', 'B62', 'B68'],
+    []
+  );
+
+  // Memoized current step data
+  const currentStepData = useMemo(() => {
+    const cell = dropdownCells[currentStep];
+    return {
+      cell,
+      label: labels[cell] || `Question ${currentStep + 1}`,
+      options: dropdownOptions[cell] || [],
+      answer: answers[cell],
+      isLastStep: currentStep === dropdownCells.length - 1
+    };
+  }, [currentStep, dropdownCells, labels, dropdownOptions, answers]);
+
+  // Sync currentStep with ref for race condition prevention
+  useEffect(() => {
+    currentStepRef.current = currentStep;
+  }, [currentStep]);
+
+  // Initialize answers and detect pre-completed steps
+  useEffect(() => {
+    setAnswers(values);
+    
+    // Find steps that are already completed
+    const completed = new Set<number>();
+    dropdownCells.forEach((cell, index) => {
+      if (values[cell]) {
+        completed.add(index);
+      }
+    });
+    setCompletedSteps(completed);
+    
+    // If current step is already completed, find next incomplete step
+    if (values[dropdownCells[currentStep]]) {
+      const nextIncompleteStep = dropdownCells.findIndex((cell, index) => 
+        index > currentStep && !values[cell]
+      );
+      if (nextIncompleteStep !== -1) {
+        setCurrentStep(nextIncompleteStep);
+      }
+    }
+  }, [values, dropdownCells, currentStep]);
+
+  // Optimized option selection handler
+  const handleOptionSelect = useCallback(async (option: string, isAutoSelection = false) => {
+    if (isProcessingRef.current) return;
+    
+    const stepCell = dropdownCells[currentStepRef.current];
+    setIsUpdating(true);
+    isProcessingRef.current = true;
+    
+    try {
+      await onUpdateValue(stepCell, option);
+      
+      // Update state optimistically
+      setAnswers(prev => ({ ...prev, [stepCell]: option }));
+      setCompletedSteps(prev => new Set([...prev, currentStepRef.current]));
+      
+      if (isAutoSelection) {
+        console.log(`⚡ Auto-selected "${option}" for ${stepCell} (${Date.now()})`);
+        setAutoSelectionQueue(prev => {
+          const newQueue = new Set(prev);
+          newQueue.delete(stepCell);
+          return newQueue;
+        });
+      }
+      
+      // Immediate navigation for better UX
+      const nextStep = findNextRequiredStep(currentStepRef.current + 1);
+      
+      if (nextStep !== -1) {
+        // Use requestAnimationFrame for smooth transitions
+        requestAnimationFrame(() => {
+          setCurrentStep(nextStep);
+          isProcessingRef.current = false;
+        });
+      } else {
+        // All steps completed
+        setTimeout(() => {
+          onComplete();
+          isProcessingRef.current = false;
+        }, isAutoSelection ? 100 : 200);
+      }
+      
+    } catch (error) {
+      console.error('❌ Error updating value:', error);
+      setAutoSelectionQueue(prev => {
+        const newQueue = new Set(prev);
+        newQueue.delete(stepCell);
+        return newQueue;
+      });
+      isProcessingRef.current = false;
+    } finally {
+      setIsUpdating(false);
+    }
+  }, [dropdownCells, onUpdateValue, onComplete]);
+
+  // Optimized function to find next step that requires user input
+  const findNextRequiredStep = useCallback((startStep: number): number => {
+    for (let step = startStep; step < dropdownCells.length; step++) {
+      const cell = dropdownCells[step];
+      const options = dropdownOptions[cell] || [];
+      const hasAnswer = answers[cell] || values[cell];
+      
+      if (!hasAnswer) {
+        if (options.length > 1) {
+          return step; // Found step requiring user input
+        }
+        // Single option steps will be auto-selected
+      }
+    }
+    return -1; // All steps completed
+  }, [dropdownCells, dropdownOptions, answers, values]);
+
+  // Batch auto-selection for maximum speed
+  const processBatchAutoSelection = useCallback(async () => {
+    if (isProcessingRef.current || isUpdating) return;
+    
+    const { cell, options, answer } = currentStepData;
+    
+    // Auto-selection criteria
+    const shouldAutoSelect = (
+      options.length === 1 &&
+      !answer &&
+      !autoSelectionQueue.has(cell) &&
+      options[0] &&
+      options[0].trim() !== '' &&
+      options[0] !== 'undefined' &&
+      options[0] !== 'null'
+    );
+    
+    if (shouldAutoSelect) {
+      console.log(`🚀 Queuing auto-selection for ${cell}:`, options[0]);
+      
+      setAutoSelectionQueue(prev => new Set([...prev, cell]));
+      
+      // Clear any existing timeout
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+      }
+      
+      // Faster auto-selection with minimal delay
+      timeoutRef.current = setTimeout(async () => {
+        if (currentStepRef.current === currentStep && !isProcessingRef.current) {
+          await handleOptionSelect(options[0], true);
+        }
+      }, 50); // Reduced delay for speed
+    }
+  }, [currentStepData, autoSelectionQueue, handleOptionSelect, currentStep, isUpdating]);
+
+  // Process auto-selection when step changes
+  useEffect(() => {
+    processBatchAutoSelection();
+    
+    return () => {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+    };
+  }, [processBatchAutoSelection]);
+
+  // Optimized navigation handler
+  const handlePrevious = useCallback(() => {
+    if (currentStep > 0 && !isProcessingRef.current) {
+      // Clear any pending auto-selection
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+      
+      setCurrentStep(currentStep - 1);
+    }
+  }, [currentStep]);
+
+  // Memoized progress calculation
+  const progress = useMemo(() => 
+    ((currentStep + 1) / dropdownCells.length) * 100,
+    [currentStep, dropdownCells.length]
+  );
+
+  // Enhanced logging for debugging
+  console.log('🔍 StepWizard State:', {
+    currentStep,
+    cell: currentStepData.cell,
+    optionsCount: currentStepData.options.length,
+    hasAnswer: !!currentStepData.answer,
+    isAutoSelecting: autoSelectionQueue.has(currentStepData.cell),
+    completedCount: completedSteps.size,
+    isProcessing: isProcessingRef.current,
+    nextRequiredStep: findNextRequiredStep(currentStep + 1)
+  });
+
+  return (
+    <div className="bg-white rounded-2xl shadow-lg p-8 max-w-2xl mx-auto">
+      {/* Enhanced Progress Bar */}
+      <div className="mb-8">
+        <div className="flex justify-between items-center mb-2">
+          <span className="text-sm font-medium text-gray-700">
+            Question {currentStep + 1} of {dropdownCells.length}
+          </span>
+          <div className="flex items-center space-x-2">
+            {autoSelectionQueue.size > 0 && (
+              <span className="text-xs text-blue-600 flex items-center">
+                <Zap className="h-3 w-3 mr-1" />
+                Auto-selecting
+              </span>
+            )}
+            <span className="text-sm text-gray-500">{Math.round(progress)}% Complete</span>
+          </div>
+        </div>
+        <div className="w-full bg-gray-200 rounded-full h-2 overflow-hidden">
+          <div 
+            className="bg-gradient-to-r from-blue-500 to-blue-600 h-2 rounded-full transition-all duration-200 ease-out"
+            style={{ width: `${progress}%` }}
+          />
+        </div>
+      </div>
+
+      {/* Question Header */}
+      <div className="mb-8">
+        <h2 className="text-2xl font-bold text-gray-900 mb-2">
+          {currentStepData.label}
+        </h2>
+        <p className="text-gray-600">
+          {currentStepData.options.length === 1 && !currentStepData.answer ? (
+            <span className="text-blue-600 font-medium flex items-center">
+              <Zap className="h-4 w-4 mr-1 animate-pulse" />
+              Auto-selecting single option...
+            </span>
+          ) : (
+            <>
+              Select one of the options below to continue
+              <span className="ml-2 text-xs text-gray-500">({currentStepData.cell})</span>
+            </>
+          )}
+        </p>
+      </div>
+
+      {/* Optimized Options Grid */}
+      <div className="mb-8">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+          {currentStepData.options.length > 0 ? (
+            currentStepData.options.map((option, index) => {
+              const isSelected = currentStepData.answer === option;
+              const isSingleOption = currentStepData.options.length === 1;
+              const isQueued = autoSelectionQueue.has(currentStepData.cell);
+              
+              return (
+                <button
+                  key={`${currentStepData.cell}-${index}`}
+                  onClick={() => handleOptionSelect(option)}
+                  disabled={isUpdating || isLoading || isProcessingRef.current}
+                  className={`w-full p-3 text-left border-2 rounded-lg transition-all duration-150 hover:border-blue-500 hover:bg-blue-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed min-h-[60px] transform hover:scale-[1.02] active:scale-[0.98] ${
+                    isSelected
+                      ? 'border-blue-500 bg-blue-50 text-blue-900 shadow-md'
+                      : isSingleOption
+                      ? 'border-blue-300 bg-blue-25 animate-pulse'
+                      : 'border-gray-200 bg-white text-gray-900'
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-medium text-sm break-words pr-2">{option}</span>
+                    <div className="flex items-center space-x-1">
+                      {isSelected && <Check className="h-5 w-5 text-blue-600 flex-shrink-0" />}
+                      {(isUpdating || isQueued) && (
+                        <RefreshCw className="h-4 w-4 text-blue-600 animate-spin flex-shrink-0" />
+                      )}
+                      {isSingleOption && !currentStepData.answer && (
+                        <Zap className="h-4 w-4 text-blue-500 animate-bounce flex-shrink-0" />
+                      )}
+                    </div>
+                  </div>
+                </button>
+              );
+            })
+          ) : (
+            <div className="col-span-full">
+              <div className="text-center py-8 text-gray-500">
+                <p>⚠️ No options available for {currentStepData.cell}</p>
+                <p className="text-sm mt-2">Check sheet configuration</p>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Enhanced Navigation */}
+      <div className="flex justify-between items-center">
+        <button
+          onClick={handlePrevious}
+          disabled={currentStep === 0 || isUpdating || isLoading || isProcessingRef.current}
+          className="inline-flex items-center px-4 py-2 border border-gray-300 rounded-lg text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-all duration-150 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          <ChevronLeft className="h-4 w-4 mr-1" />
+          Previous
+        </button>
+
+        <div className="text-sm text-center">
+          {currentStepData.answer ? (
+            <span className="text-green-600 font-medium flex items-center">
+              <Check className="h-4 w-4 mr-1" />
+              Completed
+            </span>
+          ) : currentStepData.options.length === 1 ? (
+            <span className="text-blue-600 font-medium flex items-center">
+              <Zap className="h-4 w-4 mr-1 animate-pulse" />
+              Auto-selecting...
+            </span>
+          ) : (
+            <span className="text-gray-500">Select an option to continue</span>
+          )}
+        </div>
+
+        {currentStepData.isLastStep && currentStepData.answer ? (
+          <button
+            onClick={onComplete}
+            disabled={isUpdating || isLoading || isProcessingRef.current}
+            className="inline-flex items-center px-6 py-2 border border-transparent rounded-lg text-sm font-medium text-white bg-green-600 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500 transition-all duration-150 disabled:opacity-50 disabled:cursor-not-allowed transform hover:scale-105"
+          >
+            View Results
+            <ChevronRight className="h-4 w-4 ml-1" />
+          </button>
+        ) : (
+          <div className="w-24" />
+        )}
+      </div>
+
+      {/* Performance indicator */}
+      {autoSelectionQueue.size > 0 && (
+        <div className="mt-4 text-center">
+          <div className="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-blue-100 text-blue-800 animate-pulse">
+            <RefreshCw className="h-3 w-3 mr-1 animate-spin" />
+            Processing {autoSelectionQueue.size} auto-selection{autoSelectionQueue.size > 1 ? 's' : ''}...
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
