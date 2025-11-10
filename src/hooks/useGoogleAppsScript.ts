@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { googleAppsScriptService } from '../services/googleAppsScript';
 import { GOOGLE_APPS_SCRIPT_URL } from '../constants/googleAppsScript';
 import { ApplicationType, ResultOption, ExtendedQuestion } from '../types';
@@ -150,22 +150,20 @@ export const useGoogleAppsScript = () => {
     };
   }, []);
 
-  // Optimized function to fetch options with minimal delay
-  const fetchOptionsOptimized = async (currentValues: { [key: string]: string } = values): Promise<{ [key: string]: string[] }> => {
+  const fetchOptionsOptimized = useCallback(async (currentValues: { [key: string]: string } = values): Promise<{ [key: string]: string[] }> => {
     console.log('⚡ Fast fetching options...');
     const options = await googleAppsScriptService.getDropdownOptions();
-    
-    // Quick validation - only check if we have some options
+
     const hasAnyValidOptions = Object.values(options).some(cellOptions => hasValidOptions(cellOptions));
-    
+
     if (!hasAnyValidOptions) {
       console.log('⏳ Options not ready, waiting 500ms...');
       await new Promise(resolve => setTimeout(resolve, 500));
       return googleAppsScriptService.getDropdownOptions();
     }
-    
+
     return options;
-  };
+  }, [values]);
 
   const reinitializeScript = async () => {
     setIsLoading(true);

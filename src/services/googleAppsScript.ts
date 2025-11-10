@@ -5,17 +5,26 @@ import { GOOGLE_APPS_SCRIPT_URL } from '../constants/googleAppsScript';
 const verifyUrl = (url: string): boolean => {
   try {
     const urlObj = new URL(url);
-    return urlObj.hostname === 'script.google.com' && 
-           urlObj.pathname.includes('/macros/s/') && 
+    return urlObj.hostname === 'script.google.com' &&
+           urlObj.pathname.includes('/macros/s/') &&
            url.endsWith('/exec');
   } catch {
     return false;
   }
 };
 
+interface CacheEntry {
+  data: any;
+  timestamp: number;
+  ttl: number;
+}
+
 export class GoogleAppsScriptService {
   private baseUrl: string;
   public isInitialized: boolean = false;
+  private cache: Map<string, CacheEntry> = new Map();
+  private requestQueue: Map<string, Promise<any>> = new Map();
+  private readonly DEFAULT_TTL = 300000; // 5 minutes
 
   constructor() {
     this.baseUrl = GOOGLE_APPS_SCRIPT_URL;
@@ -35,8 +44,9 @@ export class GoogleAppsScriptService {
 
   initialize(scriptUrl: string): void {
     this.baseUrl = scriptUrl;
-    
-    // Verify URL format on initialization
+    this.cache.clear();
+    this.requestQueue.clear();
+
     if (!verifyUrl(this.baseUrl)) {
       console.error('Invalid Google Apps Script URL format:', this.baseUrl);
       console.error('URL should be: https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec');
@@ -44,41 +54,94 @@ export class GoogleAppsScriptService {
     } else {
       this.isInitialized = true;
     }
-    
+
     console.log('🚀 Initialized with optimized Google Apps Script');
   }
 
-  private async makeRequest(action: string, data?: any, retries = 3): Promise<any> {
+  private getCacheKey(action: string, data?: any): string {
+    const dataStr = data ? JSON.stringify(data) : '';
+    return `${action}:${dataStr}`;
+  }
+
+  private getFromCache(key: string): any | null {
+    const entry = this.cache.get(key);
+    if (!entry) return null;
+
+    const now = Date.now();
+    if (now - entry.timestamp > entry.ttl) {
+      this.cache.delete(key);
+      return null;
+    }
+
+    return entry.data;
+  }
+
+  private setCache(key: string, data: any, ttl: number = this.DEFAULT_TTL): void {
+    this.cache.set(key, {
+      data,
+      timestamp: Date.now(),
+      ttl
+    });
+  }
+
+  private clearCache(): void {
+    this.cache.clear();
+  }
+
+  public async makeRequest(action: string, data?: any, retries = 3): Promise<any> {
     if (!this.isInitialized) {
       throw new Error('Google Apps Script service not initialized. Please provide script URL.');
     }
 
-    console.log('🔍 DEBUG: Making request for action:', action);
-    if (data) {
-      console.log('🔍 DEBUG: Request data:', data);
+    // Check cache first
+    const cacheKey = this.getCacheKey(action, data);
+    const cachedData = this.getFromCache(cacheKey);
+    if (cachedData !== null) {
+      console.log(`⚡ Cache hit for ${action}`);
+      return cachedData;
     }
 
-    // Retry logic for network issues
-    const maxRetries = 3;
+    // Check if request is already in progress (request deduplication)
+    if (this.requestQueue.has(cacheKey)) {
+      console.log(`⚡ Waiting for in-progress request: ${action}`);
+      return this.requestQueue.get(cacheKey);
+    }
+
+    // Create new request promise
+    const requestPromise = this.performRequest(action, data, retries);
+    this.requestQueue.set(cacheKey, requestPromise);
+
+    try {
+      const result = await requestPromise;
+      this.setCache(cacheKey, result);
+      return result;
+    } finally {
+      this.requestQueue.delete(cacheKey);
+    }
+  }
+
+  private async performRequest(action: string, data?: any, retries: number): Promise<any> {
+    const maxRetries = retries;
     let lastError;
-    
+
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
         return await this.attemptRequest(action, data, false, attempt);
       } catch (error) {
         lastError = error;
         console.log(`Attempt ${attempt} failed:`, error);
-        
+
+        if (attempt === maxRetries) {
           console.warn('Network error detected. Possible causes:');
           console.warn('1. Google Apps Script not deployed as web app');
           console.warn('2. Deployment permissions not set to "Anyone"');
           console.warn('3. Incorrect URL - should end with /exec');
           console.warn('4. Network connectivity issues');
           console.warn('Current URL:', this.baseUrl);
+        }
       }
     }
-    
-    // If all retries failed, provide detailed troubleshooting information
+
     throw new Error('Google Apps Script connection failed');
   }
 
@@ -295,9 +358,14 @@ Current URL: ${this.baseUrl}`;
   async updateDropdownValue(cell: string, value: string): Promise<void> {
     try {
       console.log(`⚡ Ultra-fast update ${cell}:`, value);
-      
+
+      // Invalidate related caches when updating values
+      this.cache.delete(this.getCacheKey('getDropdownValues'));
+      this.cache.delete(this.getCacheKey('getDropdownOptions'));
+      this.cache.delete(this.getCacheKey('getResults'));
+
       const result = await this.makeRequest('updateValue', { cell, value });
-      
+
       return result;
     } catch (error) {
       console.error(`Failed to update ${cell}:`, error);
@@ -308,6 +376,7 @@ Current URL: ${this.baseUrl}`;
   async clearAllValues(): Promise<void> {
     try {
       console.log('⚡ Ultra-fast batch clearing all values...');
+      this.clearCache(); // Clear all cached data when values are cleared
       const result = await this.makeRequest('clearAllValues');
       console.log(`✅ Ultra-fast batch clear: ${result.clearedCount}/${result.totalCells} cells in ${result.executionTime || 'N/A'}ms`);
     } catch (error) {
